@@ -29,6 +29,18 @@ interface GradientBackgroundSkiaProps {
   children?: React.ReactNode;
 }
 
+/**
+ * Reads a numeric width/height out of the style so a fixed-size gradient paints
+ * on its first frame rather than waiting for onLayout.
+ */
+const measureFromStyle = (style?: StyleProp<ViewStyle>) => {
+  const flat = StyleSheet.flatten(style) || {};
+  return {
+    width: typeof flat.width === "number" ? flat.width : 0,
+    height: typeof flat.height === "number" ? flat.height : 0,
+  };
+};
+
 const GradientBackgroundSkia: React.FC<GradientBackgroundSkiaProps> = ({
   style,
   colors,
@@ -43,13 +55,16 @@ const GradientBackgroundSkia: React.FC<GradientBackgroundSkiaProps> = ({
   testID,
   ...rest
 }) => {
-  const [width, setWidth] = useState(0);
-  const [height, setHeight] = useState(0);
+  const [size, setSize] = useState(() => measureFromStyle(style));
+  const { width, height } = size;
 
   const onLayout = (event: LayoutChangeEvent) => {
     const { width: w, height: h } = event.nativeEvent.layout;
-    setWidth(w);
-    setHeight(h);
+    setSize((current) =>
+      current.width === w && current.height === h
+        ? current
+        : { width: w, height: h },
+    );
   };
 
   // Calculate individual corner radii
@@ -69,23 +84,47 @@ const GradientBackgroundSkia: React.FC<GradientBackgroundSkiaProps> = ({
   const path = useMemo(() => {
     if (width === 0 || height === 0) return null;
 
+    // Radii larger than half the box make the manual path self-intersect, so
+    // cap them the way the CSS/Yoga border-radius does.
+    const limit = Math.min(width, height) / 2;
+    const tl = Math.max(0, Math.min(topLeft, limit));
+    const tr = Math.max(0, Math.min(topRight, limit));
+    const br = Math.max(0, Math.min(bottomRight, limit));
+    const bl = Math.max(0, Math.min(bottomLeft, limit));
+
     const path = Skia.Path.Make();
 
-    // Draw rounded rectangle manually since addRRect doesn't support array radii
-    path.moveTo(topLeft, 0);
-    path.lineTo(width - topRight, 0);
-    path.quadTo(width, 0, width, topRight);
-    path.lineTo(width, height - bottomRight);
-    path.quadTo(width, height, width - bottomRight, height);
-    path.lineTo(bottomLeft, height);
-    path.quadTo(0, height, 0, height - bottomLeft);
-    path.lineTo(0, topLeft);
-    path.quadTo(0, 0, topLeft, 0);
+    // Drawn by hand because addRRect does not take per-corner radii. Each corner
+    // is a quarter ellipse so it matches a View's border radius. A zero radius
+    // has no oval to sweep, so the preceding lineTo already squares it off.
+    const corner = (r: number, x: number, y: number, startAngle: number) => {
+      if (r > 0) {
+        path.arcToOval(
+          { x, y, width: r * 2, height: r * 2 },
+          startAngle,
+          90,
+          false,
+        );
+      }
+    };
+
+    path.moveTo(tl, 0);
+    path.lineTo(width - tr, 0);
+    corner(tr, width - tr * 2, 0, -90);
+    path.lineTo(width, height - br);
+    corner(br, width - br * 2, height - br * 2, 0);
+    path.lineTo(bl, height);
+    corner(bl, 0, height - bl * 2, 90);
+    path.lineTo(0, tl);
+    corner(tl, 0, 0, 180);
     path.close();
 
     return path;
   }, [width, height, topLeft, topRight, bottomRight, bottomLeft]);
 
+  // Depends on the values rather than the objects: callers pass literals for
+  // colors/start/end, which change identity on every render.
+  const colorKey = colors.join("|");
   const paint = useMemo(() => {
     if (width === 0 || height === 0) return null;
 
@@ -105,21 +144,20 @@ const GradientBackgroundSkia: React.FC<GradientBackgroundSkiaProps> = ({
     );
     p.setShader(shader);
     return p;
-  }, [width, height, colors, start, end]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [width, height, colorKey, start.x, start.y, end.x, end.y]);
 
   return (
     <View style={style} onLayout={onLayout} testID={testID} {...rest}>
       {width > 0 && height > 0 && path && paint && (
-        <Canvas style={StyleSheet.absoluteFill}>
+        <Canvas style={StyleSheet.absoluteFill} pointerEvents="none">
           <Group>
             <Path path={path} paint={paint} />
           </Group>
         </Canvas>
       )}
 
-      <View style={StyleSheet.absoluteFill} pointerEvents="box-none">
-        {children}
-      </View>
+      {children}
     </View>
   );
 };
